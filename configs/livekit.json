@@ -6,8 +6,11 @@
     }
   },
   "vad": {
-    "type": "energy",
-    "params": {}
+    "type": "silero",
+    "params": {
+      "threshold": 0.5,
+      "min_silence_ms": 500
+    }
   },
   "recognizer": {
     "type": "faster-whisper",

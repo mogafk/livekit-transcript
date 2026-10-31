@@ -6,8 +6,8 @@
 и в реальном времени транскрибирует речь каждого участника отдельно.
 
 > **Статус:** работает сквозной сценарий на живом SFU: core, pipeline, конфиг и реестр,
-> CLI, источники `wav` и `livekit`, VAD `energy`, распознаватели `dummy` и `faster-whisper`
-> (только final), sink `stdout`. Не сделано: Silero VAD, saver'ы, interim на реальной
+> CLI, источники `wav` и `livekit`, VAD `silero` и `energy`, распознаватели `dummy` и
+> `faster-whisper` (только final), sink `stdout`. Не сделано: saver'ы, interim на реальной
 > модели. Помеченное «(план)» — целевая архитектура. При расхождении кода и файла —
 > обновлять файл.
 
@@ -59,7 +59,7 @@ LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у с�
 | Вид          | Что делает                                                 | Есть                    | План                    |
 |--------------|------------------------------------------------------------|-------------------------|-------------------------|
 | `source`     | отдаёт треки спикеров с аудиокадрами                       | `wav`, `livekit`        | —                       |
-| `vad`        | превращает поток кадров в события речи                     | `energy` (порог громкости, для отладки) | `silero` |
+| `vad`        | превращает поток кадров в события речи                     | `silero`; `energy` (порог громкости, для отладки) | —   |
 | `recognizer` | превращает события речи в сегменты текста                  | `faster-whisper`; `dummy` (длительность фразы вместо текста, без GPU) | стриминговые движки |
 | `sink`       | получает каждый сегмент по мере появления (realtime-выход) | `stdout`                | стриминг событий        |
 | `saver`      | сохраняет сессию целиком: аудио и итоговый транскрипт      | —                       | `filesystem`            |
@@ -124,8 +124,9 @@ vad → recognizer → source и закрывает в обратном.
 - `core/` не зависит ни от каких внешних SDK и ни от одной реализации.
 - Тяжёлые и специфичные зависимости живут только в своём модуле: `livekit` — в
   `sources/livekit.py`, `faster_whisper` — в `recognizers/faster_whisper.py` и т. д.
-- `vad/` не использует `livekit-plugins-silero` (это тянет `livekit-agents`);
-  Silero подключать напрямую — пакет `silero-vad` / ONNX.
+- `vad/` не использует `livekit-plugins-silero` (тянет `livekit-agents`), пакет
+  `silero-vad` (тянет PyTorch) и копию Silero из faster-whisper (другой, пакетный
+  интерфейс модели + зависимость от распознавателя). Модель лежит в `vad/silero_vad.onnx`.
 
 ### Конфигурация сессии (JSON) и реестр
 
@@ -258,6 +259,28 @@ uv run python -m livekit_transcript --config configs/livekit.json --room test-1 
 - в `finalize()` — итоговый `transcript.txt`: реплики всех спикеров по времени,
   `[чч:мм:сс] Имя: текст`.
 
+### VAD `silero` и `energy`
+
+Оба решают только «речь ли этот кусок»; превращение решений в фразы (`SpeechStart` /
+`SpeechFrames` / `SpeechEnd`, `pre_roll_ms`, `min_silence_ms`) — общий
+`vad/segmenter.py:PhraseSegmenter`.
+
+- `silero` — нейросетевой Silero VAD 6.2.3, ONNX через `onnxruntime` на CPU, без PyTorch.
+  Модель `vad/silero_vad.onnx` взята без изменений из wheel `silero-vad` 6.2.3 с PyPI
+  (sha256 `1a153a22…88e3`), лицензия MIT — `vad/silero_vad.LICENSE`; входит в wheel пакета.
+  - Входящие кадры (10–20 мс) перерезаются в окна модели по 512 сэмплов (32 мс) +
+    64 сэмпла контекста от предыдущего окна; состояние модели — своё на трек,
+    `InferenceSession` — одна на процесс.
+  - Гистерезис: фраза начинается при вероятности ≥ `threshold` (0.5), внутри фразы
+    тишина — < `neg_threshold` (по умолчанию `threshold − 0.15`, как в `VADIterator` Silero).
+  - Хвост короче окна не классифицируется: внутри фразы он дописывается к ней.
+  - ~0.17 мс CPU на окно (0.19 с на 36 с аудио) — считается прямо в event loop,
+    перескок в поток дороже самого инференса.
+  - На `samples/alice.wav` с шумом −35 dBFS и щелчками: `silero` — те же 8 фраз, что на
+    чистой записи; `energy` — одна «фраза» на весь файл. Тон и белый шум `silero` речью
+    не считает (есть тест).
+- `energy` — порог громкости, без модели: для отладки и тестов pipeline.
+
 ### Распознаватель `faster-whisper`
 
 - Копит кадры фразы и распознаёт её целиком на `SpeechEnd` → final-сегмент.
@@ -291,7 +314,7 @@ uv run python -m livekit_transcript --config configs/livekit.json --room test-1 
 - **numpy** — обработка аудио
 - **faster-whisper** + **nvidia-cublas-cu12** / **nvidia-cudnn-cu12** — распознавание на GPU
   (локально RTX 4070, 12 ГБ)
-- план: **silero-vad**
+- **onnxruntime** — Silero VAD на CPU (модель в пакете)
 - **uv** — зависимости и окружение
 - **ruff** — линтер и форматтер
 - **pytest** + **pytest-asyncio** — тесты
@@ -321,7 +344,9 @@ livekit-transcript/
 │   │   ├── livekit.py        # LiveKitSource; LiveKitSettings (переменные окружения) — здесь же
 │   │   └── wav.py
 │   ├── vad/
-│   │   └── energy.py         # план: silero.py
+│   │   ├── segmenter.py      # общая нарезка решений «речь/не речь» на фразы
+│   │   ├── silero.py         # + silero_vad.onnx, silero_vad.LICENSE
+│   │   └── energy.py
 │   ├── recognizers/
 │   │   ├── dummy.py
 │   │   └── faster_whisper.py

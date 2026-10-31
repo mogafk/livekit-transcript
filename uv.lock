@@ -593,6 +593,7 @@ dependencies = [
     { name = "numpy" },
     { name = "nvidia-cublas-cu12" },
     { name = "nvidia-cudnn-cu12" },
+    { name = "onnxruntime" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
 ]
@@ -612,6 +613,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "nvidia-cublas-cu12", specifier = ">=12.4,<12.9.3" },
     { name = "nvidia-cudnn-cu12", specifier = ">=9,<10" },
+    { name = "onnxruntime", specifier = ">=1.31.1" },
     { name = "pydantic", specifier = ">=2.14.2" },
     { name = "pydantic-settings", specifier = ">=2.16.2" },
 ]

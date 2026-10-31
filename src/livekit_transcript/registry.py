@@ -27,6 +27,7 @@ IMPLEMENTATIONS: dict[type[Component], dict[str, str]] = {
     },
     Vad: {
         "energy": "livekit_transcript.vad.energy:EnergyVad",
+        "silero": "livekit_transcript.vad.silero:SileroVad",
     },
     Recognizer: {
         "dummy": "livekit_transcript.recognizers.dummy:DummyRecognizer",

@@ -18,9 +18,9 @@
     }
   },
   "vad": {
-    "type": "energy",
+    "type": "silero",
     "params": {
-      "threshold_dbfs": -45,
+      "threshold": 0.5,
       "min_silence_ms": 500
     }
   },
