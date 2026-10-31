@@ -362,7 +362,8 @@ livekit-transcript/
 ├── README.md
 ├── pyproject.toml
 ├── .env.example
-├── configs/                  # конфиги сессии: livekit.json, livekit-record.json (+ saver), wav.json
+├── configs/                  # конфиги сессии: livekit.json, livekit-record.json (+ saver),
+│                             # livekit-http-sink.json (+ sink http), wav.json
 ├── sessions/                 # записанные сессии saver'а filesystem (в .gitignore)
 ├── samples/                  # свои WAV для источника wav (в .gitignore)
 ├── docs/
