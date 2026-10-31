@@ -1,0 +1,40 @@
+{
+  "source": {
+    "type": "livekit",
+    "params": {
+      "room": "set-with---room"
+    }
+  },
+  "vad": {
+    "type": "silero",
+    "params": {
+      "threshold": 0.5,
+      "min_silence_ms": 500
+    }
+  },
+  "recognizer": {
+    "type": "faster-whisper",
+    "params": {
+      "model": "large-v3-turbo",
+      "device": "cuda",
+      "compute_type": "float16",
+      "language": "en"
+    }
+  },
+  "sinks": [
+    {
+      "type": "stdout",
+      "params": {
+        "format": "jsonl"
+      }
+    }
+  ],
+  "savers": [
+    {
+      "type": "filesystem",
+      "params": {
+        "dir": "sessions"
+      }
+    }
+  ]
+}

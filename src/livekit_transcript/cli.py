@@ -22,6 +22,11 @@ def main(argv: list[str] | None = None) -> None:
         description="Транскрибация созвона по спикерам в реальном времени",
     )
     parser.add_argument("--config", type=Path, required=True, help="JSON-конфиг сессии")
+    parser.add_argument(
+        "--source",
+        type=Path,
+        help="JSON с секцией source вместо той, что в конфиге (например, source.json сессии)",
+    )
     parser.add_argument("--room", help="имя комнаты, переопределяет source.params.room")
     parser.add_argument("--log-level", default="INFO", help="уровень логов в stderr")
     args = parser.parse_args(argv)
@@ -42,7 +47,7 @@ def main(argv: list[str] | None = None) -> None:
             logging.getLogger(name).setLevel(logging.WARNING)
 
     try:
-        pipeline = build_pipeline(load_config(args.config, room=args.room))
+        pipeline = build_pipeline(load_config(args.config, room=args.room, source=args.source))
     except ConfigError as e:
         logger.error("%s", e)
         sys.exit(2)

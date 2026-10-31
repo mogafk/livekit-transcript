@@ -18,7 +18,7 @@
       "model": "large-v3-turbo",
       "device": "cuda",
       "compute_type": "float16",
-      "language": "ru"
+      "language": "en"
     }
   },
   "sinks": [

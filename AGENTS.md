@@ -7,13 +7,14 @@
 
 > **Статус:** работает сквозной сценарий на живом SFU: core, pipeline, конфиг и реестр,
 > CLI, источники `wav` и `livekit`, VAD `silero` и `energy`, распознаватели `dummy` и
-> `faster-whisper` (только final), sink `stdout`. Не сделано: saver'ы, interim на реальной
-> модели. Помеченное «(план)» — целевая архитектура. При расхождении кода и файла —
+> `faster-whisper` (только final), sink `stdout`, saver `filesystem` (запись и переигровка
+> сессий). Не сделано: sink для сервера отображения, interim на реальной модели. Помеченное «(план)» — целевая архитектура. При расхождении кода и файла —
 > обновлять файл.
 
 LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у соседнего
 проекта `../livekit-bot` (бот создаёт комнаты, имя комнаты — `meetingId`).
 Сервис запускается **локально** на машине разработчика с GPU; деплой пока не планируется.
+Созвоны — **на английском**: `language: "en"` в конфигах, выбор моделей — под английский.
 
 Основной сценарий:
 
@@ -62,7 +63,7 @@ LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у с�
 | `vad`        | превращает поток кадров в события речи                     | `silero`; `energy` (порог громкости, для отладки) | —   |
 | `recognizer` | превращает события речи в сегменты текста                  | `faster-whisper`; `dummy` (длительность фразы вместо текста, без GPU) | стриминговые движки |
 | `sink`       | получает каждый сегмент по мере появления (realtime-выход) | `stdout`                | стриминг событий        |
-| `saver`      | сохраняет сессию целиком: аудио и итоговый транскрипт      | —                       | `filesystem`            |
+| `saver`      | сохраняет сессию целиком: аудио и итоговый транскрипт      | `filesystem`            | —                       |
 
 `energy` и `dummy` — не заглушки для удаления, а отладочные реализации: с ними pipeline
 гоняется целиком без моделей и GPU (тесты, проверка источников).
@@ -147,7 +148,7 @@ vad → recognizer → source и закрывает в обратном.
   "recognizer": {
     "type": "faster-whisper",
     "params": { "model": "large-v3-turbo", "device": "cuda",
-                "compute_type": "float16", "language": "ru" }
+                "compute_type": "float16", "language": "en" }
   },
   "sinks": [
     { "type": "stdout", "params": { "format": "jsonl" } }
@@ -160,7 +161,8 @@ vad → recognizer → source и закрывает в обратном.
 
 Источник из WAV-файлов — по файлу на спикера (PCM 16 бит, 16 кГц, моно; другое —
 ошибка конфига с командой ffmpeg для конвертации); `realtime: true` отдаёт кадры
-в темпе реального времени (для проверки realtime-поведения без SFU):
+в темпе реального времени (для проверки realtime-поведения без SFU); `offset_ms` —
+когда файл начинается относительно старта сессии (спикер зашёл позже):
 
 ```json
 "source": {
@@ -168,12 +170,17 @@ vad → recognizer → source и закрывает в обратном.
   "params": {
     "files": [
       { "path": "samples/alice.wav", "speaker_id": "alice", "speaker_name": "Алиса" },
-      { "path": "samples/bob.wav",   "speaker_id": "bob",   "speaker_name": "Боб" }
+      { "path": "samples/bob.wav",   "speaker_id": "bob",   "speaker_name": "Боб",
+        "offset_ms": 0 }
     ],
     "realtime": true
   }
 }
 ```
+
+`--source <файл>` в CLI заменяет секцию `source` конфига содержимым файла (обычно
+`source.json` сохранённой сессии): так запись переигрывается с любыми настройками
+VAD/распознавателя из основного конфига.
 
 Как это устроено в коде:
 
@@ -250,14 +257,35 @@ uv run python scripts/publish_wav.py --room test-1 --delay 15 --delete-room \
 uv run python -m livekit_transcript --config configs/livekit.json --room test-1  # в другом терминале
 ```
 
-### Saver `filesystem` — поведение (план)
+### Saver `filesystem` — запись и переигровка сессий
 
-Каталог сессии `<dir>/<room>-<время старта>/`:
+Зачем: баг на живом созвоне → та же сессия локально через источник `wav`, с любыми
+настройками. Включается конфигом (`configs/livekit-record.json`), по умолчанию запись
+не ведётся — это запись звонка.
 
-- `<speaker_id>.wav` — аудио спикера, дописывается по ходу созвона;
-- `segments.jsonl` — все финальные сегменты по мере появления;
-- в `finalize()` — итоговый `transcript.txt`: реплики всех спикеров по времени,
-  `[чч:мм:сс] Имя: текст`.
+Каталог сессии `<dir>/<session>-<локальное время старта>/` (`-2`, `-3` при совпадении):
+
+- `<speaker_id>.wav` — сырое аудио спикера (до VAD) с его первого кадра, дописывается
+  по ходу созвона; заголовок WAV обновляется раз в секунду аудио — после падения
+  процесса файл читаем. Небезопасные для имени файла символы id → `_`.
+- `segments.jsonl` — финальные сегменты по мере появления (как `stdout` jsonl).
+- `source.json` — секция `source` для источника `wav`: абсолютные пути, `speaker_name`,
+  `offset_ms` первого кадра спикера от старта сессии, `realtime: false`. Пишется при
+  появлении каждого нового спикера (переживает падение) и в `finalize()`.
+- `transcript.txt` — в `finalize()`: реплики всех спикеров по времени,
+  `[чч:мм:сс] Имя: текст` (пустые final пропускаются).
+
+Время внутри файла:
+- Переподключившийся спикер дописывается в тот же файл.
+- Разрыв между кадрами ≥ `min_gap_ms` (500) заполняется тишиной по меткам времени —
+  файл остаётся на шкале сессии. Меньшие разрывы не заполняются: метки LiveKit — время
+  прихода кадра, их дрожание при заполнении сдвигало бы файл вперёд реального времени.
+- На практике LiveKit присылает кадры непрерывно с момента подписки, тишину тоже:
+  `offset_ms` ≈ моменту входа участника, дыр почти нет.
+
+Проверено на SFU: записанная через `publish_wav.py` сессия, переигранная через
+`--source`, дала те же 14 реплик слово в слово (включая ошибку распознавания).
+~1.9 МБ на минуту на спикера.
 
 ### VAD `silero` и `energy`
 
@@ -302,8 +330,10 @@ uv run python -m livekit_transcript --config configs/livekit.json --room test-1 
 поэтому `_add_cuda_dll_dirs()` добавляет `site-packages/nvidia/*/bin` перед загрузкой модели.
 `nvidia-cublas-cu12` ограничен `<12.9.3`: у 12.9.3.13 нет wheel под Windows.
 
-Окончательный выбор движка открыт. Другие кандидаты: **GigaAM v3** (русский),
-**T-one** (стриминговый, русский), **sherpa-onnx** streaming Zipformer (CPU).
+Окончательный выбор движка открыт; язык — английский. Другие кандидаты:
+**distil-large-v3.5** (английский дистиллят Whisper, быстрее turbo — тот же recognizer,
+другой `model`), **NVIDIA Parakeet TDT** (английский, высокая точность и скорость,
+нужен новый recognizer), **sherpa-onnx** streaming Zipformer (CPU, настоящий стриминг).
 
 ## Стек
 
@@ -327,7 +357,8 @@ livekit-transcript/
 ├── README.md
 ├── pyproject.toml
 ├── .env.example
-├── configs/                  # примеры конфигов сессии: livekit.json, wav.json
+├── configs/                  # конфиги сессии: livekit.json, livekit-record.json (+ saver), wav.json
+├── sessions/                 # записанные сессии saver'а filesystem (в .gitignore)
 ├── samples/                  # свои WAV для источника wav (в .gitignore)
 ├── scripts/
 │   └── publish_wav.py        # тестовые участники: WAV → микрофоны в комнате LiveKit
@@ -352,7 +383,8 @@ livekit-transcript/
 │   │   └── faster_whisper.py
 │   ├── sinks/
 │   │   └── stdout.py
-│   └── savers/               # план: filesystem.py
+│   └── savers/
+│       └── filesystem.py
 └── tests/                    # helpers.py: генерация WAV, CollectingSink, RecordingSaver
 ```
 
@@ -379,6 +411,8 @@ livekit-transcript/
 ```bash
 uv sync                                                                   # зависимости
 uv run python -m livekit_transcript --config configs/livekit.json --room <room_name>
+uv run python -m livekit_transcript --config configs/livekit-record.json --room <room_name>  # + запись в sessions/
+uv run python -m livekit_transcript --config configs/livekit.json --source sessions/<сессия>/source.json  # переиграть
 uv run python -m livekit_transcript --config configs/wav.json            # без SFU, нужны samples/*.wav
 uv run pytest                                                             # тесты (без GPU)
 uv run pytest -m gpu                                                      # тесты на GPU и samples/
@@ -420,6 +454,14 @@ uv run ruff format .                                                      # фо
 ## Открытые вопросы
 
 - **Движок распознавания** и способ получения interim-результатов.
-- **Sink для внешних потребителей** (будущий веб-сервис): скорее всего стриминг событий;
-  транспорт пока не выбран.
+- **Sink для внешних потребителей** (будущий веб-сервис отображения): транспорт не выбран,
+  рассматривается HTTP POST. Что уже понятно:
+  - интерфейсу `Sink` не хватает событий сессии (`session_started`, спикер зашёл/вышел,
+    `session_ended`) — сервер должен знать, к какой сессии относится сегмент;
+  - порядок при HTTP может перепутаться: реплики сервер сортирует по `start`, а версии
+    одной реплики (interim/final с одним `segment_id`) — по правилу «final побеждает»
+    и/или по `seq` (сквозной номер события в сессии), иначе запоздавший interim
+    затрёт final;
+  - сервер создаёт сессию по первому событию с её id, не дожидаясь `session_started`;
+  - буфер и повтор при недоступности сервера, токен в `.env`.
 - **Уведомление участников** о транскрибации — отложено.

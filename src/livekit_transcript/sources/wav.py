@@ -27,6 +27,8 @@ class WavFile(ComponentParams):
     path: Path
     speaker_id: str = Field(min_length=1)
     speaker_name: str | None = None
+    # When the file starts relative to the session start: a speaker who joined later
+    offset_ms: int = Field(default=0, ge=0)
 
 
 class WavSourceParams(ComponentParams):
@@ -58,11 +60,16 @@ class WavSource(Source):
         clock_start = asyncio.get_running_loop().time()
         for file in self._params.files:
             speaker = Speaker(id=file.speaker_id, name=file.speaker_name or file.speaker_id)
-            yield SpeakerTrack(speaker, self._frames(file.path, started_at, clock_start))
+            file_start = timedelta(milliseconds=file.offset_ms)
+            frames = self._frames(
+                file.path, started_at + file_start, clock_start + file.offset_ms / 1000
+            )
+            yield SpeakerTrack(speaker, frames)
 
     async def _frames(
         self, path: Path, started_at: datetime, clock_start: float
     ) -> AsyncIterator[AudioFrame]:
+        """`started_at` / `clock_start` — when this file starts, in UTC and loop time."""
         loop = asyncio.get_running_loop()
         frame_bytes = SAMPLE_RATE * self._params.frame_ms // 1000 * SAMPLE_WIDTH
         offset = 0  # samples from the start of the file

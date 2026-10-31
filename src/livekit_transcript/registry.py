@@ -36,7 +36,9 @@ IMPLEMENTATIONS: dict[type[Component], dict[str, str]] = {
     Sink: {
         "stdout": "livekit_transcript.sinks.stdout:StdoutSink",
     },
-    Saver: {},
+    Saver: {
+        "filesystem": "livekit_transcript.savers.filesystem:FilesystemSaver",
+    },
 }
 
 

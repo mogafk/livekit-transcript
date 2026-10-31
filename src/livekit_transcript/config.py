@@ -27,19 +27,29 @@ class SessionConfig(BaseModel):
     savers: list[ComponentConfig] = Field(default_factory=list)
 
 
-def load_config(path: Path, *, room: str | None = None) -> SessionConfig:
-    """Reads the JSON config. `room` overrides `source.params.room`."""
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as e:
-        raise ConfigError(f"Не удалось прочитать конфиг {path}: {e}") from e
-    except json.JSONDecodeError as e:
-        raise ConfigError(f"Конфиг {path} — невалидный JSON: {e}") from e
-    try:
-        config = SessionConfig.model_validate(raw)
-    except ValidationError as e:
-        raise ConfigError(f"Конфиг {path}:\n{e}") from e
+def load_config(
+    path: Path, *, room: str | None = None, source: Path | None = None
+) -> SessionConfig:
+    """Reads the JSON config. `source` — a file with a `source` section replacing the config's
+    one (e.g. `source.json` of a saved session); `room` overrides `source.params.room`.
+    """
+    config = _load(path, SessionConfig)
+    if source is not None:
+        config.source = _load(source, ComponentConfig)
     if room is not None:
         # A source without a `room` param rejects it during params validation
         config.source.params["room"] = room
     return config
+
+
+def _load[T: BaseModel](path: Path, model: type[T]) -> T:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise ConfigError(f"Не удалось прочитать {path}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{path} — невалидный JSON: {e}") from e
+    try:
+        return model.model_validate(raw)
+    except ValidationError as e:
+        raise ConfigError(f"{path}:\n{e}") from e
