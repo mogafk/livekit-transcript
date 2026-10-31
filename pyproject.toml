@@ -8,7 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "faster-whisper>=1.2.1",
+    "livekit>=1.2.0",
+    "livekit-api>=1.2.2",
     "numpy>=2.5.4",
+    "nvidia-cublas-cu12>=12.4,<12.9.3",
+    "nvidia-cudnn-cu12>=9,<10",
     "pydantic>=2.14.2",
     "pydantic-settings>=2.16.2",
 ]
@@ -29,6 +34,9 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# GPU tests: uv run pytest -m gpu
+addopts = "-m 'not gpu'"
+markers = ["gpu: needs a CUDA GPU, the Whisper model and samples/*.wav"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

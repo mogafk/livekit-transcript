@@ -30,6 +30,7 @@ IMPLEMENTATIONS: dict[type[Component], dict[str, str]] = {
     },
     Recognizer: {
         "dummy": "livekit_transcript.recognizers.dummy:DummyRecognizer",
+        "faster-whisper": "livekit_transcript.recognizers.faster_whisper:FasterWhisperRecognizer",
     },
     Sink: {
         "stdout": "livekit_transcript.sinks.stdout:StdoutSink",

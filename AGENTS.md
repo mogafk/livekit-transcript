@@ -5,10 +5,11 @@
 Консольный сервис на Python, который подключается к идущему созвону в LiveKit SFU
 и в реальном времени транскрибирует речь каждого участника отдельно.
 
-> **Статус:** готов каркас — core, pipeline, конфиг и реестр, CLI, источник `wav`,
-> VAD `energy`, распознаватель `dummy`, sink `stdout`. Источник `livekit` — заготовка
-> (params и переменные окружения проверяются, `start()` бросает `NotImplementedError`).
-> Остальное в этом файле — целевая архитектура. При расхождении кода и файла — обновлять файл.
+> **Статус:** работает сквозной сценарий на живом SFU: core, pipeline, конфиг и реестр,
+> CLI, источники `wav` и `livekit`, VAD `energy`, распознаватели `dummy` и `faster-whisper`
+> (только final), sink `stdout`. Не сделано: Silero VAD, saver'ы, interim на реальной
+> модели. Помеченное «(план)» — целевая архитектура. При расхождении кода и файла —
+> обновлять файл.
 
 LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у соседнего
 проекта `../livekit-bot` (бот создаёт комнаты, имя комнаты — `meetingId`).
@@ -57,9 +58,9 @@ LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у с�
 
 | Вид          | Что делает                                                 | Есть                    | План                    |
 |--------------|------------------------------------------------------------|-------------------------|-------------------------|
-| `source`     | отдаёт треки спикеров с аудиокадрами                       | `wav`, `livekit` (заготовка) | `livekit`          |
+| `source`     | отдаёт треки спикеров с аудиокадрами                       | `wav`, `livekit`        | —                       |
 | `vad`        | превращает поток кадров в события речи                     | `energy` (порог громкости, для отладки) | `silero` |
-| `recognizer` | превращает события речи в сегменты текста                  | `dummy` (длительность фразы вместо текста, без GPU) | `faster-whisper`, … |
+| `recognizer` | превращает события речи в сегменты текста                  | `faster-whisper`; `dummy` (длительность фразы вместо текста, без GPU) | стриминговые движки |
 | `sink`       | получает каждый сегмент по мере появления (realtime-выход) | `stdout`                | стриминг событий        |
 | `saver`      | сохраняет сессию целиком: аудио и итоговый транскрипт      | —                       | `filesystem`            |
 
@@ -200,6 +201,8 @@ vad → recognizer → source и закрывает в обратном.
 
 - `segment_id` стабилен для одной фразы: interim-сегменты с тем же id заменяют
   предыдущие, финальный — последний для этого id. Потребитель обновляет реплику на месте.
+- `segment_id` уникален в сессии: номер фразы сквозной на спикера в пределах
+  распознавателя, а не трека — переподключившийся участник не повторит `alice:1`.
 - Время — абсолютное UTC, присвоенное источником; по нему упорядочиваются реплики
   разных спикеров.
 - stdout принадлежит `stdout`-sink'у. Служебные логи (`logging`) — только в stderr.
@@ -210,17 +213,41 @@ vad → recognizer → source и закрывает в обратном.
 заканчиваются, недоговорённые фразы закрываются VAD и распознаются, saver'ы
 финализируются, код выхода 0. Второй Ctrl+C — немедленный выход (код 130).
 
-### Источник `livekit` — поведение (план)
+### Источник `livekit` — поведение
 
+- Перед входом проверяет через Server API (`ListRooms`), что комната есть: вход в
+  несуществующую комнату либо создал бы пустую, либо (на нашем SFU автосоздание
+  выключено, комнаты создаёт бот) упал бы с 404. Нет комнаты / SFU недоступен /
+  ключи не подходят — `ConfigError`, код выхода 2.
+- Identity — `params.identity` + случайный суффикс (`transcriber-1a2b3c`): участник
+  с тем же identity выбил бы предыдущего (два транскрибатора в одной комнате).
 - Подписка только на аудио с источником `MICROPHONE`; `SCREEN_SHARE_AUDIO` игнорируется.
-- Игнорировать себя и других агентов/скрытых участников (`ParticipantKind.AGENT`).
-- Участник зашёл позже — подхватить его трек. Трек unpublished / участник вышел —
-  закрыть `SpeakerTrack` (поток распознавания дожимает последнюю фразу).
+  Агенты (`ParticipantKind.AGENT`) игнорируются; скрытых участников SFU и так не показывает.
+- Участники, бывшие в комнате до нас и зашедшие позже, подхватываются одинаково
+  (`track_subscribed`, `auto_subscribe=True`). `track_unsubscribed` (вышел, снял трек) —
+  `SpeakerTrack` закрывается, распознаватель дожимает последнюю фразу.
 - Mute — просто нет кадров, трек не закрывается.
-- Переподключение участника с тем же `identity` — тот же `Speaker`.
-- Комната закрылась / нас отключили — конец сессии, код выхода 0;
-  комната не найдена / ошибка авторизации — понятная ошибка в stderr, код ≠ 0.
-- Ресемплинг — средствами SDK: `rtc.AudioStream(track, sample_rate=16000, num_channels=1)`.
+- Переподключение участника с тем же `identity` — новый трек того же `Speaker`.
+- Комната удалена / нас отключили — конец сессии, код выхода 0.
+- Кадры: `rtc.AudioStream(track, sample_rate=16000, num_channels=1)` (ресемплинг в SDK).
+  Время кадра — момент получения минус длительность кадра. Свой `_TrackFeed` с
+  очередью на трек: трек закрываем своим сигналом, не дожидаясь end-of-stream от SDK
+  (`AudioStream.aclose()` ждёт его и может зависнуть).
+- Проверено на нашем SFU (`LIVEKIT_URL` из `.env`) через `scripts/publish_wav.py`: задержка
+  final 0.6–1.2 с после конца фразы.
+
+### `scripts/publish_wav.py` — тестовые участники
+
+Отладочный скрипт: создаёт комнату через API (если её нет), заводит по участнику на
+WAV-файл и проигрывает файлы как их микрофоны в реальном времени. `--delay` — пауза
+перед речью, чтобы успеть запустить транскрибатор; `--delete-room` — удалить комнату
+в конце (транскрибатор увидит `ROOM_DELETED` и завершит сессию).
+
+```bash
+uv run python scripts/publish_wav.py --room test-1 --delay 15 --delete-room \
+    samples/alice.wav:alice:Алиса samples/bob.wav:bob:Боб
+uv run python -m livekit_transcript --config configs/livekit.json --room test-1  # в другом терминале
+```
 
 ### Saver `filesystem` — поведение (план)
 
@@ -231,23 +258,40 @@ vad → recognizer → source и закрывает в обратном.
 - в `finalize()` — итоговый `transcript.txt`: реплики всех спикеров по времени,
   `[чч:мм:сс] Имя: текст`.
 
-### Распознавание
+### Распознаватель `faster-whisper`
 
-- Первая реализация: faster-whisper, нарезка по VAD → распознавание фразы целиком →
-  final-сегмент. Interim-результаты — следующим шагом.
-- Окончательный выбор движка открыт. Кандидаты: **faster-whisper** `large-v3-turbo`
-  (мультиязычный), **GigaAM v3** (русский), **T-one** (стриминговый, русский),
-  **sherpa-onnx** streaming Zipformer (CPU).
+- Копит кадры фразы и распознаёт её целиком на `SpeechEnd` → final-сегмент.
+  `interim_every_ms` — перераспознавание незаконченной фразы для interim-сегментов
+  (реализовано, по умолчанию выключено, на реальном созвоне ещё не проверялось).
+- Модель грузится в `start()` и сразу прогревается (первый инференс в разы медленнее).
+  Инференс — в одном потоке-воркере (`ThreadPoolExecutor(max_workers=1)`): GPU
+  обрабатывает одну фразу за раз, треки встают в очередь.
+- Против галлюцинаций Whisper: фразы короче `min_phrase_ms` не распознаются,
+  `condition_on_previous_text=False`, `no_speech_threshold`. Пустой текст — сегмента нет,
+  но если по фразе уже были interim-сегменты, отдаётся пустой final, чтобы их закрыть.
+- На вход модели — numpy float32, не файл: декодирование файлов в faster-whisper 1.2.1
+  несовместимо с `av` 19.
+- Замер на `samples/` (RTX 4070, `large-v3-turbo` float16, realtime): текст приходит
+  через 0.6–1.0 с после конца фразы, из них ~0.5 с — `min_silence_ms` VAD.
+
+**CUDA на Windows.** CTranslate2 нужны CUDA 12 cuBLAS и cuDNN 9 — ставятся pip-пакетами
+`nvidia-cublas-cu12`, `nvidia-cudnn-cu12` (CUDA Toolkit не нужен). Их DLL не на пути поиска,
+поэтому `_add_cuda_dll_dirs()` добавляет `site-packages/nvidia/*/bin` перед загрузкой модели.
+`nvidia-cublas-cu12` ограничен `<12.9.3`: у 12.9.3.13 нет wheel под Windows.
+
+Окончательный выбор движка открыт. Другие кандидаты: **GigaAM v3** (русский),
+**T-one** (стриминговый, русский), **sherpa-onnx** streaming Zipformer (CPU).
 
 ## Стек
 
 - **Python 3.12+**
 - **livekit** — rtc SDK (подключение к комнате, подписка на треки)
-- **livekit-api** — генерация токена доступа
+- **livekit-api** — токен доступа, проверка комнаты (Server API)
 - **pydantic** / **pydantic-settings** — конфиг сессии (JSON) и переменные окружения
 - **numpy** — обработка аудио
-- план: **silero-vad**, **faster-whisper** (первый настоящий recognizer), CUDA-GPU
-  (RTX 4070, 12 ГБ; faster-whisper требует CUDA 12 + cuDNN 9)
+- **faster-whisper** + **nvidia-cublas-cu12** / **nvidia-cudnn-cu12** — распознавание на GPU
+  (локально RTX 4070, 12 ГБ)
+- план: **silero-vad**
 - **uv** — зависимости и окружение
 - **ruff** — линтер и форматтер
 - **pytest** + **pytest-asyncio** — тесты
@@ -262,6 +306,8 @@ livekit-transcript/
 ├── .env.example
 ├── configs/                  # примеры конфигов сессии: livekit.json, wav.json
 ├── samples/                  # свои WAV для источника wav (в .gitignore)
+├── scripts/
+│   └── publish_wav.py        # тестовые участники: WAV → микрофоны в комнате LiveKit
 ├── src/livekit_transcript/
 │   ├── __main__.py           # python -m livekit_transcript
 │   ├── cli.py                # аргументы, логирование, запуск и Ctrl+C
@@ -272,12 +318,13 @@ livekit-transcript/
 │   │   ├── interfaces.py     # Component, Source, Vad, Recognizer, Sink, Saver, ConfigError
 │   │   └── pipeline.py       # связывает компоненты, жизненный цикл сессии
 │   ├── sources/
-│   │   ├── livekit.py        # заготовка; LiveKitSettings (переменные окружения) — здесь же
+│   │   ├── livekit.py        # LiveKitSource; LiveKitSettings (переменные окружения) — здесь же
 │   │   └── wav.py
 │   ├── vad/
 │   │   └── energy.py         # план: silero.py
 │   ├── recognizers/
-│   │   └── dummy.py          # план: faster_whisper.py
+│   │   ├── dummy.py
+│   │   └── faster_whisper.py
 │   ├── sinks/
 │   │   └── stdout.py
 │   └── savers/               # план: filesystem.py
@@ -296,7 +343,7 @@ livekit-transcript/
 
 | Переменная              | Описание                                                       |
 |-------------------------|----------------------------------------------------------------|
-| `LIVEKIT_URL`           | WebSocket URL SFU (`wss://host` или `ws://localhost:7880`)     |
+| `LIVEKIT_URL`           | адрес SFU в любой схеме: `https://host/livekit`, `wss://host`, `http://localhost:7880`. Из него выводятся оба адреса: http(s) — Server API, ws(s) — подключение к комнате |
 | `LIVEKIT_API_KEY`       | API key LiveKit                                                |
 | `LIVEKIT_API_SECRET`    | API secret LiveKit                                             |
 
@@ -308,7 +355,8 @@ livekit-transcript/
 uv sync                                                                   # зависимости
 uv run python -m livekit_transcript --config configs/livekit.json --room <room_name>
 uv run python -m livekit_transcript --config configs/wav.json            # без SFU, нужны samples/*.wav
-uv run pytest                                                             # тесты
+uv run pytest                                                             # тесты (без GPU)
+uv run pytest -m gpu                                                      # тесты на GPU и samples/
 uv run ruff check . --fix                                                 # линтер
 uv run ruff format .                                                      # форматирование
 ```
@@ -328,13 +376,17 @@ uv run ruff format .                                                      # фо
 - Логирование — стандартный `logging` в stderr, без `print`. stdout принадлежит sink'у.
 - Тесты pipeline — на источнике `wav` (WAV генерируются в тесте: тон/тишина),
   `energy` + `dummy` и фейковых sink/saver из `tests/helpers.py`, без живого SFU.
-  Тесты, требующие GPU или SFU, помечать маркерами и не запускать по умолчанию.
+  Распознаватели тестируются на фейковой модели (подмена `_load`). Тесты, требующие
+  GPU, — маркер `gpu` (исключён по умолчанию в `addopts`); требующие SFU — свой маркер.
 - Комментарии в коде — на английском; сообщения пользователю (логи, ошибки) — на русском.
 
 ## Безопасность и приватность
 
 - Никогда не коммитить `.env`, токены и секреты. В репозитории только `.env.example`.
 - Не логировать `LIVEKIT_API_SECRET` и сгенерированный токен.
+- `LIVEKIT_API_SECRET` текущего SFU — 30 байт, PyJWT предупреждает
+  (`InsecureKeyLengthWarning`, нужно ≥ 32 для HS256). Не глушить: лечится
+  заменой секрета на SFU (общий с `livekit-bot`).
 - Токен сервиса — минимальные права: `room_join` в одну комнату, `can_subscribe=True`,
   `can_publish=False`, `hidden=True`, короткий TTL.
 - Транскрипты и аудио — персональные данные: текст речи не писать в логи выше DEBUG,

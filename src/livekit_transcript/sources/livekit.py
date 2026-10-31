@@ -1,23 +1,33 @@
-"""LiveKit SFU as a source. NOT IMPLEMENTED YET: params, settings and the planned behavior only.
+"""LiveKit SFU as a source: a hidden participant that subscribes to every speaker's microphone."""
 
-Plan (see "Источник livekit" in AGENTS.md):
-- start(): generate a token with `livekit-api` (`AccessToken`: room_join to this room only,
-  can_subscribe, no publishing, hidden, short TTL) and connect with the `livekit` rtc SDK;
-- subscribe to MICROPHONE audio of every participant, including late joiners;
-  ignore SCREEN_SHARE_AUDIO, ourselves and agents (ParticipantKind.AGENT);
-- one SpeakerTrack per participant, speaker id = identity; frames via
-  `rtc.AudioStream(track, sample_rate=16000, num_channels=1)` with UTC arrival time;
-- track unpublished / participant left -> its frames end; mute -> just no frames;
-- room closed or disconnected -> tracks() ends; stop() -> disconnect gracefully.
-"""
-
+import asyncio
+import logging
+import secrets
 from collections.abc import AsyncIterator
+from datetime import timedelta
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import Field, SecretStr, ValidationError
+import aiohttp
+from livekit import api, rtc
+from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from livekit_transcript.core.interfaces import ComponentParams, ConfigError, Source
-from livekit_transcript.core.models import SpeakerTrack
+from livekit_transcript.core.models import (
+    NUM_CHANNELS,
+    SAMPLE_RATE,
+    AudioFrame,
+    Speaker,
+    SpeakerTrack,
+    utc_now,
+)
+
+logger = logging.getLogger(__name__)
+
+# The token is only for connecting: while connected the SFU refreshes it itself
+TOKEN_TTL = timedelta(minutes=10)
+# How long to wait for the SDK to close an audio stream on shutdown
+STREAM_CLOSE_TIMEOUT_S = 2.0
 
 
 class LiveKitSettings(BaseSettings):
@@ -25,14 +35,74 @@ class LiveKitSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # Any of http(s):// or ws(s)://, may include a reverse-proxy path
     livekit_url: str
     livekit_api_key: str
     livekit_api_secret: SecretStr
 
+    @field_validator("livekit_url")
+    @classmethod
+    def _check_scheme(cls, value: str) -> str:
+        if urlsplit(value).scheme not in {"http", "https", "ws", "wss"}:
+            raise ValueError("ожидается http(s):// или ws(s)://")
+        return value
+
+    def url(self, *, websocket: bool) -> str:
+        parts = urlsplit(self.livekit_url)
+        secure = parts.scheme in {"https", "wss"}
+        scheme = ("wss" if secure else "ws") if websocket else ("https" if secure else "http")
+        return urlunsplit(parts._replace(scheme=scheme))
+
 
 class LiveKitSourceParams(ComponentParams):
     room: str = Field(min_length=1)
+    # A random suffix is appended: a second participant with the same identity would kick us out
     identity: str = Field(default="transcriber", min_length=1)
+
+
+class _TrackFeed:
+    """Frames of one subscribed track.
+
+    Ends by our own signal (unsubscribed, stop, disconnect) rather than relying on the SDK's
+    end-of-stream: `rtc.AudioStream.aclose()` waits for it and may hang without it.
+    """
+
+    def __init__(self, track: rtc.Track, speaker: Speaker) -> None:
+        self._speaker = speaker
+        self._stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
+        self._queue: asyncio.Queue[AudioFrame | None] = asyncio.Queue()
+        self._ended = False
+        self._pump = asyncio.create_task(self._run(), name=f"livekit-audio-{speaker.id}")
+
+    async def _run(self) -> None:
+        try:
+            async for event in self._stream:
+                frame = event.frame
+                # The frame has just been received, so it started `duration` ago
+                duration = timedelta(seconds=frame.samples_per_channel / frame.sample_rate)
+                self._queue.put_nowait(AudioFrame(bytes(frame.data), utc_now() - duration))
+        except Exception:
+            logger.exception("Спикер %s: ошибка чтения аудио", self._speaker.id)
+        finally:
+            self.end()
+
+    def end(self) -> None:
+        if not self._ended:
+            self._ended = True
+            self._queue.put_nowait(None)
+
+    async def frames(self) -> AsyncIterator[AudioFrame]:
+        while (frame := await self._queue.get()) is not None:
+            yield frame
+
+    async def aclose(self) -> None:
+        self.end()
+        self._pump.cancel()
+        await asyncio.wait([self._pump])
+        try:
+            await asyncio.wait_for(self._stream.aclose(), STREAM_CLOSE_TIMEOUT_S)
+        except TimeoutError:
+            logger.debug("Спикер %s: аудиопоток SDK не закрылся вовремя", self._speaker.id)
 
 
 class LiveKitSource(Source):
@@ -46,15 +116,123 @@ class LiveKitSource(Source):
         except ValidationError as e:
             raise ConfigError(
                 "source (livekit): задайте LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET "
-                "в окружении или в .env (шаблон — .env.example)"
+                f"в окружении или в .env (шаблон — .env.example):\n{e}"
             ) from e
+        self._room: rtc.Room | None = None
+        self._tracks: asyncio.Queue[SpeakerTrack | None] = asyncio.Queue()
+        # By track sid; ended feeds stay here until aclose() releases their SDK streams
+        self._feeds: dict[str, _TrackFeed] = {}
+        self._finished = False
 
     async def start(self) -> None:
-        raise NotImplementedError("Источник livekit ещё не реализован")
+        await self._check_room_exists()
+        identity = f"{self._params.identity}-{secrets.token_hex(3)}"
+        token = (
+            api.AccessToken(
+                self._settings.livekit_api_key,
+                self._settings.livekit_api_secret.get_secret_value(),
+            )
+            .with_identity(identity)
+            .with_name("Transcriber")
+            .with_ttl(TOKEN_TTL)
+            .with_grants(
+                api.VideoGrants(
+                    room_join=True,
+                    room=self._params.room,
+                    can_subscribe=True,
+                    can_publish=False,
+                    can_publish_data=False,
+                    hidden=True,
+                )
+            )
+            .to_jwt()
+        )
+        room = rtc.Room()
+        room.on("track_subscribed", self._on_track_subscribed)
+        room.on("track_unsubscribed", self._on_track_unsubscribed)
+        room.on("disconnected", self._on_disconnected)
+        room.on("reconnecting", lambda: logger.warning("Связь с SFU потеряна, переподключаемся"))
+        room.on("reconnected", lambda: logger.info("Связь с SFU восстановлена"))
+        try:
+            await room.connect(self._settings.url(websocket=True), token)
+        except rtc.ConnectError as e:
+            raise ConfigError(f"source (livekit): не удалось подключиться к комнате: {e}") from e
+        self._room = room
+        logger.info(
+            "Подключены к комнате %s как %s (скрытый участник)", self._params.room, identity
+        )
+
+    async def _check_room_exists(self) -> None:
+        """Joining a missing room would silently create an empty one, so check first."""
+        try:
+            async with api.LiveKitAPI(
+                self._settings.url(websocket=False),
+                self._settings.livekit_api_key,
+                self._settings.livekit_api_secret.get_secret_value(),
+            ) as lkapi:
+                response = await lkapi.room.list_rooms(
+                    api.ListRoomsRequest(names=[self._params.room])
+                )
+        except api.TwirpError as e:
+            raise ConfigError(f"source (livekit): SFU отклонил запрос: {e.message}") from e
+        except (aiohttp.ClientError, OSError) as e:
+            raise ConfigError(f"source (livekit): SFU недоступен: {e}") from e
+        if not response.rooms:
+            raise ConfigError(f"source (livekit): комнаты {self._params.room!r} нет на SFU")
+
+    def _on_track_subscribed(
+        self,
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        if (
+            self._finished
+            or track.kind != rtc.TrackKind.KIND_AUDIO
+            or publication.source != rtc.TrackSource.SOURCE_MICROPHONE
+            or participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+        ):
+            return
+        speaker = Speaker(id=participant.identity, name=participant.name or participant.identity)
+        feed = _TrackFeed(track, speaker)
+        self._feeds[publication.sid] = feed
+        self._tracks.put_nowait(SpeakerTrack(speaker, feed.frames()))
+
+    def _on_track_unsubscribed(
+        self,
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        feed = self._feeds.get(publication.sid)
+        if feed is not None:
+            feed.end()
+
+    def _on_disconnected(self, reason: rtc.DisconnectReason.ValueType) -> None:
+        if not self._finished:
+            logger.info("Отключены от комнаты: %s", rtc.DisconnectReason.Name(reason))
+        self._finish()
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        for feed in self._feeds.values():
+            feed.end()
+        self._tracks.put_nowait(None)
 
     async def tracks(self) -> AsyncIterator[SpeakerTrack]:
-        raise NotImplementedError("Источник livekit ещё не реализован")
-        yield  # makes this an async generator, like the real implementation
+        while (track := await self._tracks.get()) is not None:
+            yield track
 
     def stop(self) -> None:
-        return None
+        self._finish()
+
+    async def aclose(self) -> None:
+        self._finish()
+        for feed in self._feeds.values():
+            await feed.aclose()
+        self._feeds.clear()
+        if self._room is not None:
+            await self._room.disconnect()
+            self._room = None

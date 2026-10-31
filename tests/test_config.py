@@ -79,3 +79,26 @@ def test_missing_wav_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="nope.wav"):
         build_pipeline(load_config(config))
+
+
+@pytest.mark.parametrize(
+    ("url", "api_url", "rtc_url"),
+    [
+        (
+            "https://sfu.example.com/livekit",
+            "https://sfu.example.com/livekit",
+            "wss://sfu.example.com/livekit",
+        ),
+        ("wss://sfu.example.com", "https://sfu.example.com", "wss://sfu.example.com"),
+        ("http://localhost:7880", "http://localhost:7880", "ws://localhost:7880"),
+    ],
+)
+def test_livekit_url_gives_api_and_rtc_urls(
+    monkeypatch: pytest.MonkeyPatch, url: str, api_url: str, rtc_url: str
+) -> None:
+    from livekit_transcript.sources.livekit import LiveKitSettings
+
+    settings = LiveKitSettings(livekit_url=url, livekit_api_key="k", livekit_api_secret="s")
+
+    assert settings.url(websocket=False) == api_url
+    assert settings.url(websocket=True) == rtc_url

@@ -12,6 +12,9 @@ from livekit_transcript.registry import build_pipeline
 
 logger = logging.getLogger("livekit_transcript")
 
+# "livekit" is the Rust core of the SDK: connection steps at INFO
+NOISY_LOGGERS = ("faster_whisper", "httpx", "httpx2", "huggingface_hub", "livekit")
+
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
@@ -33,6 +36,10 @@ def main(argv: list[str] | None = None) -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if logging.getLogger().level > logging.DEBUG:
+        # Libraries log every phrase and HTTP request at INFO
+        for name in NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
     try:
         pipeline = build_pipeline(load_config(args.config, room=args.room))

@@ -3,22 +3,45 @@
     "type": "wav",
     "params": {
       "files": [
-        { "path": "samples/alice.wav", "speaker_id": "alice", "speaker_name": "Алиса" },
-        { "path": "samples/bob.wav", "speaker_id": "bob", "speaker_name": "Боб" }
+        {
+          "path": "samples/alice.wav",
+          "speaker_id": "alice",
+          "speaker_name": "Алиса"
+        },
+        {
+          "path": "samples/bob.wav",
+          "speaker_id": "bob",
+          "speaker_name": "Боб"
+        }
       ],
       "realtime": true
     }
   },
   "vad": {
     "type": "energy",
-    "params": { "threshold_dbfs": -45, "min_silence_ms": 500 }
+    "params": {
+      "threshold_dbfs": -45,
+      "min_silence_ms": 500
+    }
   },
   "recognizer": {
-    "type": "dummy",
-    "params": { "interim_every_ms": 1000 }
+    "type": "faster-whisper",
+    "params": {
+      "model": "large-v3-turbo",
+      "device": "cuda",
+      "compute_type": "float16",
+      "language": "en",
+      "initial_prompt": "LiveKit, SFU, faster-whisper, diarization"
+    }
   },
   "sinks": [
-    { "type": "stdout", "params": { "format": "text", "interim": false } }
+    {
+      "type": "stdout",
+      "params": {
+        "format": "text",
+        "interim": false
+      }
+    }
   ],
   "savers": []
 }

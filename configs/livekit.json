@@ -1,18 +1,30 @@
 {
   "source": {
     "type": "livekit",
-    "params": { "room": "set-with---room" }
+    "params": {
+      "room": "set-with---room"
+    }
   },
   "vad": {
     "type": "energy",
     "params": {}
   },
   "recognizer": {
-    "type": "dummy",
-    "params": {}
+    "type": "faster-whisper",
+    "params": {
+      "model": "large-v3-turbo",
+      "device": "cuda",
+      "compute_type": "float16",
+      "language": "ru"
+    }
   },
   "sinks": [
-    { "type": "stdout", "params": { "format": "jsonl" } }
+    {
+      "type": "stdout",
+      "params": {
+        "format": "jsonl"
+      }
+    }
   ],
   "savers": []
 }

@@ -1,7 +1,9 @@
 """Recognizes nothing: reports how long each phrase is. For debugging pipelines without a GPU."""
 
+from collections import defaultdict
 from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timedelta
+from itertools import count
 
 from pydantic import Field
 
@@ -26,6 +28,8 @@ class DummyRecognizer(Recognizer):
 
     def __init__(self, params: DummyRecognizerParams) -> None:
         self._params = params
+        # Per speaker across tracks: a rejoined speaker must not reuse segment ids
+        self._phrase_ids: defaultdict[str, count[int]] = defaultdict(lambda: count(1))
 
     async def transcribe(
         self, speaker: Speaker, events: AsyncIterator[SpeechEvent]
@@ -54,7 +58,7 @@ class DummyRecognizer(Recognizer):
         async for event in events:
             match event:
                 case SpeechStart(time=time):
-                    phrase += 1
+                    phrase = next(self._phrase_ids[speaker.id])
                     start, duration, reported = time, timedelta(), timedelta()
                 case SpeechFrames(frames=frames) if start is not None:
                     duration += sum((frame.duration for frame in frames), timedelta())
