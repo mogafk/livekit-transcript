@@ -1,0 +1,18 @@
+{
+  "source": {
+    "type": "livekit",
+    "params": { "room": "set-with---room" }
+  },
+  "vad": {
+    "type": "energy",
+    "params": {}
+  },
+  "recognizer": {
+    "type": "dummy",
+    "params": {}
+  },
+  "sinks": [
+    { "type": "stdout", "params": { "format": "jsonl" } }
+  ],
+  "savers": []
+}

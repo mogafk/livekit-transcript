@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# uv / venv
+.venv/
+
+# Tools
+.ruff_cache/
+.pytest_cache/
+
+# Secrets
+.env
+
+# Recordings and transcripts are personal data
+samples/
+sessions/

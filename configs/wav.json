@@ -1,0 +1,24 @@
+{
+  "source": {
+    "type": "wav",
+    "params": {
+      "files": [
+        { "path": "samples/alice.wav", "speaker_id": "alice", "speaker_name": "Алиса" },
+        { "path": "samples/bob.wav", "speaker_id": "bob", "speaker_name": "Боб" }
+      ],
+      "realtime": true
+    }
+  },
+  "vad": {
+    "type": "energy",
+    "params": { "threshold_dbfs": -45, "min_silence_ms": 500 }
+  },
+  "recognizer": {
+    "type": "dummy",
+    "params": { "interim_every_ms": 1000 }
+  },
+  "sinks": [
+    { "type": "stdout", "params": { "format": "text", "interim": false } }
+  ],
+  "savers": []
+}
