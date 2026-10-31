@@ -1,8 +1,9 @@
 """Data passed between components. Only the standard library here."""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 # The single audio format of the pipeline: sources convert to it, everyone else relies on it
 SAMPLE_RATE = 16_000
@@ -54,6 +55,8 @@ class SpeakerTrack:
 class SessionInfo:
     name: str
     started_at: datetime
+    # Unique per run: the same room can be transcribed many times
+    id: str = field(default_factory=lambda: str(uuid4()))
 
 
 # VAD output: SpeechStart, then one or more SpeechFrames, then SpeechEnd — per phrase

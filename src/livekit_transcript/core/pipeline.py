@@ -18,31 +18,33 @@ from livekit_transcript.core.models import (
 
 logger = logging.getLogger(__name__)
 
-# Queued segments per sink after which we warn that the sink can't keep up
+# Queued events per sink after which we warn that the sink can't keep up
 SINK_BACKLOG_WARNING = 1000
 
 
 class _SinkWriter:
-    """Feeds one sink from its own queue, so a slow sink doesn't stall recognition."""
+    """Feeds one sink from its own queue, so a slow sink doesn't stall recognition.
+    One queue for all of the sink's events keeps them in the order they happened.
+    """
 
     def __init__(self, sink: Sink) -> None:
         self._sink = sink
-        self._queue: asyncio.Queue[TranscriptSegment | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[methodcaller | None] = asyncio.Queue()
         self._warned = False
 
-    def put(self, segment: TranscriptSegment) -> None:
-        self._queue.put_nowait(segment)
+    def put(self, method: str, *args: object) -> None:
+        self._queue.put_nowait(methodcaller(method, *args))
         if self._queue.qsize() > SINK_BACKLOG_WARNING and not self._warned:
             self._warned = True
-            logger.warning("Sink %s не успевает обрабатывать сегменты", type(self._sink).__name__)
+            logger.warning("Sink %s не успевает обрабатывать события", type(self._sink).__name__)
 
     def close(self) -> None:
         self._queue.put_nowait(None)
 
     async def run(self) -> None:
-        while (segment := await self._queue.get()) is not None:
+        while (call := await self._queue.get()) is not None:
             try:
-                await self._sink.on_segment(segment)
+                await call(self._sink)
             except Exception:
                 logger.exception("Ошибка в sink %s", type(self._sink).__name__)
 
@@ -85,6 +87,7 @@ class Pipeline:
         logger.info("Сессия %s начата", session.name)
         await self._notify_savers("on_session_start", session)
         self._writers = [_SinkWriter(sink) for sink in self._sinks]
+        self._notify_sinks("on_session_start", session)
         try:
             async with asyncio.TaskGroup() as writers:
                 for writer in self._writers:
@@ -94,6 +97,7 @@ class Pipeline:
                         async for track in self._source.tracks():
                             tracks.create_task(self._process_track(track))
                 finally:
+                    self._notify_sinks("on_session_end")
                     for writer in self._writers:
                         writer.close()
         finally:
@@ -104,6 +108,7 @@ class Pipeline:
         speaker = track.speaker
         logger.info("Спикер %s (%s): трек начат", speaker.name, speaker.id)
         await self._notify_savers("on_track_start", speaker)
+        self._notify_sinks("on_track_start", speaker)
         try:
             events = self._vad.process(self._tee_to_savers(speaker, track.frames))
             async with aclosing(self._recognizer.transcribe(speaker, events)) as segments:
@@ -114,6 +119,7 @@ class Pipeline:
             logger.exception("Спикер %s: ошибка обработки трека", speaker.id)
         finally:
             await self._notify_savers("on_track_end", speaker)
+            self._notify_sinks("on_track_end", speaker)
             logger.info("Спикер %s (%s): трек завершён", speaker.name, speaker.id)
 
     async def _tee_to_savers(
@@ -124,10 +130,13 @@ class Pipeline:
             yield frame
 
     async def _publish(self, segment: TranscriptSegment) -> None:
-        for writer in self._writers:
-            writer.put(segment)
+        self._notify_sinks("on_segment", segment)
         if segment.is_final:
             await self._notify_savers("on_segment", segment)
+
+    def _notify_sinks(self, method: str, *args: object) -> None:
+        for writer in self._writers:
+            writer.put(method, *args)
 
     async def _notify_savers(self, method: str, *args: object) -> None:
         call = methodcaller(method, *args)

@@ -7,9 +7,10 @@
 
 > **Статус:** работает сквозной сценарий на живом SFU: core, pipeline, конфиг и реестр,
 > CLI, источники `wav` и `livekit`, VAD `silero` и `energy`, распознаватели `dummy` и
-> `faster-whisper` (только final), sink `stdout`, saver `filesystem` (запись и переигровка
-> сессий). Не сделано: sink для сервера отображения, interim на реальной модели. Помеченное «(план)» — целевая архитектура. При расхождении кода и файла —
-> обновлять файл.
+> `faster-whisper` (только final), sinks `stdout` и `http` (протокол — `docs/http-sink.md`),
+> saver `filesystem` (запись и переигровка сессий). Не сделано: сам сервер отображения
+> (есть только отладочный `scripts/http_sink_server.py`), interim на реальной модели.
+> Помеченное «(план)» — целевая архитектура. При расхождении кода и файла — обновлять файл.
 
 LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у соседнего
 проекта `../livekit-bot` (бот создаёт комнаты, имя комнаты — `meetingId`).
@@ -62,7 +63,7 @@ LiveKit SFU — **self-hosted** (не LiveKit Cloud), тот же, что у с�
 | `source`     | отдаёт треки спикеров с аудиокадрами                       | `wav`, `livekit`        | —                       |
 | `vad`        | превращает поток кадров в события речи                     | `silero`; `energy` (порог громкости, для отладки) | —   |
 | `recognizer` | превращает события речи в сегменты текста                  | `faster-whisper`; `dummy` (длительность фразы вместо текста, без GPU) | стриминговые движки |
-| `sink`       | получает каждый сегмент по мере появления (realtime-выход) | `stdout`                | стриминг событий        |
+| `sink`       | получает каждый сегмент по мере появления (realtime-выход) | `stdout`, `http`        | —                       |
 | `saver`      | сохраняет сессию целиком: аудио и итоговый транскрипт      | `filesystem`            | —                       |
 
 `energy` и `dummy` — не заглушки для удаления, а отладочные реализации: с ними pipeline
@@ -107,9 +108,13 @@ vad → recognizer → source и закрывает в обратном.
     interim-сегменты, а `SpeechEnd` использует как сигнал финализировать фразу.
   - Модель загружается **один раз** в `start()` и разделяется всеми треками;
     инференс — вне event loop (`asyncio.to_thread` / поток-воркер с очередью к GPU).
-- **Sink** — `on_segment(segment)` на каждый сегмент (interim и final).
-  Медленный sink не тормозит распознавание: pipeline кормит каждый sink из своей
-  очереди и предупреждает в лог, если очередь разрослась.
+- **Sink** — `on_session_start(session)`, `on_track_start(speaker)`, `on_segment(segment)`
+  на каждый сегмент (interim и final), `on_track_end(speaker)`, `on_session_end()`;
+  обязателен только `on_segment`. Медленный sink не тормозит распознавание: pipeline
+  кормит каждый sink из своей очереди (одной на все его события — порядок сохраняется)
+  и предупреждает в лог, если очередь разрослась.
+- `SessionInfo.id` — UUID на каждый запуск: одну комнату (`name`) можно транскрибировать
+  несколько раз.
 - **Saver** — получает события сессии по ходу: `on_session_start`, `on_track_start`,
   `on_frame`, `on_segment` (**только финальные**), `on_track_end`, а в конце —
   `finalize()` (вызывается всегда, в том числе при ошибке). Аудио **пишется на диск
@@ -360,8 +365,11 @@ livekit-transcript/
 ├── configs/                  # конфиги сессии: livekit.json, livekit-record.json (+ saver), wav.json
 ├── sessions/                 # записанные сессии saver'а filesystem (в .gitignore)
 ├── samples/                  # свои WAV для источника wav (в .gitignore)
+├── docs/
+│   └── http-sink.md          # протокол sink http для разработчика сервера отображения
 ├── scripts/
-│   └── publish_wav.py        # тестовые участники: WAV → микрофоны в комнате LiveKit
+│   ├── publish_wav.py        # тестовые участники: WAV → микрофоны в комнате LiveKit
+│   └── http_sink_server.py   # отладочный сервер отображения: печатает реплики
 ├── src/livekit_transcript/
 │   ├── __main__.py           # python -m livekit_transcript
 │   ├── cli.py                # аргументы, логирование, запуск и Ctrl+C
@@ -382,7 +390,8 @@ livekit-transcript/
 │   │   ├── dummy.py
 │   │   └── faster_whisper.py
 │   ├── sinks/
-│   │   └── stdout.py
+│   │   ├── stdout.py
+│   │   └── http.py           # HttpSinkSettings (HTTP_SINK_*) — здесь же
 │   └── savers/
 │       └── filesystem.py
 └── tests/                    # helpers.py: генерация WAV, CollectingSink, RecordingSaver
@@ -403,6 +412,8 @@ livekit-transcript/
 | `LIVEKIT_URL`           | адрес SFU в любой схеме: `https://host/livekit`, `wss://host`, `http://localhost:7880`. Из него выводятся оба адреса: http(s) — Server API, ws(s) — подключение к комнате |
 | `LIVEKIT_API_KEY`       | API key LiveKit                                                |
 | `LIVEKIT_API_SECRET`    | API secret LiveKit                                             |
+| `HTTP_SINK_URL`         | куда sink `http` шлёт POST; `https://`, `http://` — только на localhost или с `allow_insecure` |
+| `HTTP_SINK_TOKEN`       | общий с сервером отображения токен, уходит как `Authorization: Bearer`; случайный (`secrets.token_urlsafe(32)`) |
 
 `--room` в CLI переопределяет `source.params.room` (только для источника `livekit`).
 
@@ -450,18 +461,13 @@ uv run ruff format .                                                      # фо
   `can_publish=False`, `hidden=True`, короткий TTL.
 - Транскрипты и аудио — персональные данные: текст речи не писать в логи выше DEBUG,
   каталог сессий (`sessions/`) — в `.gitignore`.
+- `HTTP_SINK_TOKEN` идёт в заголовке открытым текстом — защищает его только TLS, поэтому
+  sink `http` отказывается слать на `http://` не-localhost без `allow_insecure: true`.
+  Дополнительно шифровать токен бессмысленно; следующий уровень, если понадобится, —
+  HMAC-подпись тела с меткой времени (защита от подмены и повтора).
 
 ## Открытые вопросы
 
 - **Движок распознавания** и способ получения interim-результатов.
-- **Sink для внешних потребителей** (будущий веб-сервис отображения): транспорт не выбран,
-  рассматривается HTTP POST. Что уже понятно:
-  - интерфейсу `Sink` не хватает событий сессии (`session_started`, спикер зашёл/вышел,
-    `session_ended`) — сервер должен знать, к какой сессии относится сегмент;
-  - порядок при HTTP может перепутаться: реплики сервер сортирует по `start`, а версии
-    одной реплики (interim/final с одним `segment_id`) — по правилу «final побеждает»
-    и/или по `seq` (сквозной номер события в сессии), иначе запоздавший interim
-    затрёт final;
-  - сервер создаёт сессию по первому событию с её id, не дожидаясь `session_started`;
-  - буфер и повтор при недоступности сервера, токен в `.env`.
+- **Сервер отображения** — не начат; протокол для него зафиксирован в `docs/http-sink.md`.
 - **Уведомление участников** о транскрибации — отложено.

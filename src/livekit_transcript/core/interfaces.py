@@ -79,10 +79,24 @@ class Recognizer(Component, ABC):
 
 
 class Sink(Component, ABC):
-    """Realtime output: receives every segment, interim and final, as soon as it appears."""
+    """Realtime output: receives every segment, interim and final, as soon as it appears,
+    plus session and speaker events — all in the order they happened.
+    """
+
+    async def on_session_start(self, session: SessionInfo) -> None:
+        return None
+
+    async def on_track_start(self, speaker: Speaker) -> None:
+        return None
 
     @abstractmethod
     async def on_segment(self, segment: TranscriptSegment) -> None: ...
+
+    async def on_track_end(self, speaker: Speaker) -> None:
+        return None
+
+    async def on_session_end(self) -> None:
+        return None
 
 
 class Saver(Component, ABC):

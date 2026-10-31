@@ -587,6 +587,7 @@ name = "livekit-transcript"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "faster-whisper" },
     { name = "livekit" },
     { name = "livekit-api" },
@@ -607,6 +608,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14.5" },
     { name = "faster-whisper", specifier = ">=1.2.1" },
     { name = "livekit", specifier = ">=1.2.0" },
     { name = "livekit-api", specifier = ">=1.2.2" },
