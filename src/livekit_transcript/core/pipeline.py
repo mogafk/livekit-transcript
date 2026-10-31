@@ -89,6 +89,10 @@ class Pipeline:
         self._writers = [_SinkWriter(sink) for sink in self._sinks]
         self._notify_sinks("on_session_start", session)
         try:
+            await self._source.on_session_start(session)
+        except Exception:
+            logger.exception("Ошибка в source %s", type(self._source).__name__)
+        try:
             async with asyncio.TaskGroup() as writers:
                 for writer in self._writers:
                     writers.create_task(writer.run())

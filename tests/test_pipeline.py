@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from livekit_transcript.core.models import SAMPLE_RATE
+from livekit_transcript.core.models import SAMPLE_RATE, SessionInfo
 from livekit_transcript.core.pipeline import Pipeline
 from livekit_transcript.recognizers.dummy import DummyRecognizer, DummyRecognizerParams
 from livekit_transcript.sinks.stdout import StdoutSink, StdoutSinkParams
@@ -110,3 +110,16 @@ async def test_stdout_sink_writes_jsonl(capsys: pytest.CaptureFixture[str], tmp_
     alice = next(line for line in lines if line["speaker_id"] == "alice")
     assert alice["speaker_name"] == "Алиса"
     assert alice["start"].endswith("Z")
+
+
+async def test_source_learns_session_before_tracks(tmp_path: Path) -> None:
+    pipeline, _, saver = make_pipeline(tmp_path)
+    seen = []
+
+    async def on_session_start(session: SessionInfo) -> None:
+        seen.append((session.id, saver.calls[:]))
+
+    pipeline._source.on_session_start = on_session_start  # type: ignore[method-assign]
+    await pipeline.run()
+
+    assert seen == [(saver.session.id, [])]

@@ -17,6 +17,7 @@ from livekit_transcript.core.models import (
     NUM_CHANNELS,
     SAMPLE_RATE,
     AudioFrame,
+    SessionInfo,
     Speaker,
     SpeakerTrack,
     utc_now,
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 TOKEN_TTL = timedelta(minutes=10)
 # How long to wait for the SDK to close an audio stream on shutdown
 STREAM_CLOSE_TIMEOUT_S = 2.0
+# Chat topic of LiveKit components (LiveKit Meet) for text streams
+CHAT_TOPIC = "lk.chat"
+CHAT_SEND_TIMEOUT_S = 5.0
 
 
 class LiveKitSettings(BaseSettings):
@@ -39,6 +43,8 @@ class LiveKitSettings(BaseSettings):
     livekit_url: str
     livekit_api_key: str
     livekit_api_secret: SecretStr
+    # Base URL of the display UI; the chat announcement links to {url}/sessions/{session id}
+    transcript_view_url: str | None = None
 
     @field_validator("livekit_url")
     @classmethod
@@ -46,6 +52,20 @@ class LiveKitSettings(BaseSettings):
         if urlsplit(value).scheme not in {"http", "https", "ws", "wss"}:
             raise ValueError("ожидается http(s):// или ws(s)://")
         return value
+
+    @field_validator("transcript_view_url")
+    @classmethod
+    def _check_view_url(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        if urlsplit(value).scheme not in {"http", "https"}:
+            raise ValueError("ожидается http(s)://")
+        return value.rstrip("/")
+
+    def view_url(self, session_id: str) -> str | None:
+        if self.transcript_view_url is None:
+            return None
+        return f"{self.transcript_view_url}/sessions/{session_id}"
 
     def url(self, *, websocket: bool) -> str:
         parts = urlsplit(self.livekit_url)
@@ -58,6 +78,8 @@ class LiveKitSourceParams(ComponentParams):
     room: str = Field(min_length=1)
     # A random suffix is appended: a second participant with the same identity would kick us out
     identity: str = Field(default="transcriber", min_length=1)
+    # Tell participants in the room chat that they are transcribed (and where to watch)
+    announce: bool = True
 
 
 class _TrackFeed:
@@ -123,6 +145,9 @@ class LiveKitSource(Source):
         # By track sid; ended feeds stay here until aclose() releases their SDK streams
         self._feeds: dict[str, _TrackFeed] = {}
         self._finished = False
+        # Set at session start; participants joining later get it personally
+        self._announcement: str | None = None
+        self._chat_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         await self._check_room_exists()
@@ -141,7 +166,8 @@ class LiveKitSource(Source):
                     room=self._params.room,
                     can_subscribe=True,
                     can_publish=False,
-                    can_publish_data=False,
+                    # Only for the chat announcement
+                    can_publish_data=self._params.announce,
                     hidden=True,
                 )
             )
@@ -151,6 +177,7 @@ class LiveKitSource(Source):
         room.on("track_subscribed", self._on_track_subscribed)
         room.on("track_unsubscribed", self._on_track_unsubscribed)
         room.on("disconnected", self._on_disconnected)
+        room.on("participant_connected", self._on_participant_connected)
         room.on("reconnecting", lambda: logger.warning("Связь с SFU потеряна, переподключаемся"))
         room.on("reconnected", lambda: logger.info("Связь с SFU восстановлена"))
         try:
@@ -179,6 +206,52 @@ class LiveKitSource(Source):
             raise ConfigError(f"source (livekit): SFU недоступен: {e}") from e
         if not response.rooms:
             raise ConfigError(f"source (livekit): комнаты {self._params.room!r} нет на SFU")
+
+    async def on_session_start(self, session: SessionInfo) -> None:
+        if not self._params.announce:
+            return
+        url = self._settings.view_url(session.id)
+        if url is None:
+            logger.info("TRANSCRIPT_VIEW_URL не задан: сообщение в чат будет без ссылки")
+            self._announcement = "Audio transcription is on."
+        else:
+            self._announcement = f"Audio transcription is on. Live transcript: {url}"
+        await self._send_chat(self._announcement)
+        logger.info("В чат комнаты отправлено сообщение о транскрипции")
+
+    def _on_participant_connected(self, participant: rtc.RemoteParticipant) -> None:
+        # Chat history isn't replayed to newcomers, so tell each of them personally
+        if (
+            self._announcement is None
+            or self._finished
+            or participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+        ):
+            return
+        task = asyncio.create_task(
+            self._send_chat_logged(self._announcement, participant.identity),
+            name=f"livekit-chat-{participant.identity}",
+        )
+        self._chat_tasks.add(task)
+        task.add_done_callback(self._chat_tasks.discard)
+
+    async def _send_chat(self, text: str, identity: str | None = None) -> None:
+        assert self._room is not None
+        await asyncio.wait_for(
+            self._room.local_participant.send_text(
+                text,
+                topic=CHAT_TOPIC,
+                destination_identities=[identity] if identity else None,
+                # Browser clients may not support compressed streams
+                compress=False,
+            ),
+            CHAT_SEND_TIMEOUT_S,
+        )
+
+    async def _send_chat_logged(self, text: str, identity: str) -> None:
+        try:
+            await self._send_chat(text, identity)
+        except Exception:
+            logger.exception("Не удалось отправить сообщение в чат участнику %s", identity)
 
     def _on_track_subscribed(
         self,
@@ -230,6 +303,9 @@ class LiveKitSource(Source):
 
     async def aclose(self) -> None:
         self._finish()
+        for task in self._chat_tasks:
+            task.cancel()
+        await asyncio.gather(*self._chat_tasks, return_exceptions=True)
         for feed in self._feeds.values():
             await feed.aclose()
         self._feeds.clear()

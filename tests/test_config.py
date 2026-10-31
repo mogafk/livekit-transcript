@@ -102,3 +102,24 @@ def test_livekit_url_gives_api_and_rtc_urls(
 
     assert settings.url(websocket=False) == api_url
     assert settings.url(websocket=True) == rtc_url
+
+
+@pytest.mark.parametrize(
+    ("base", "link"),
+    [
+        ("http://localhost:5173", "http://localhost:5173/sessions/s-1"),
+        ("https://ui.example.com/transcripts/", "https://ui.example.com/transcripts/sessions/s-1"),
+        ("", None),
+    ],
+)
+def test_transcript_view_url_links_to_session(base: str, link: str | None) -> None:
+    from livekit_transcript.sources.livekit import LiveKitSettings
+
+    settings = LiveKitSettings(
+        livekit_url="https://sfu.example.com",
+        livekit_api_key="k",
+        livekit_api_secret="s",
+        transcript_view_url=base,
+    )
+
+    assert settings.view_url("s-1") == link

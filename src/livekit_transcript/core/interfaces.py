@@ -53,6 +53,10 @@ class Source(Component, ABC):
     def tracks(self) -> AsyncIterator[SpeakerTrack]:
         """Yields tracks as speakers appear. Exhausted = end of the session."""
 
+    async def on_session_start(self, session: SessionInfo) -> None:
+        """Called once the session has an id, before the first track is taken."""
+        return None
+
     @abstractmethod
     def stop(self) -> None:
         """Requests a graceful end: `tracks()` and every track's frames finish soon."""
