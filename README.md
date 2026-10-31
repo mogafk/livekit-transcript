@@ -17,5 +17,3 @@ uv run python -m livekit_transcript --config configs/livekit.json --room <room_n
 ```bash
 ffmpeg -i input.m4a -ar 16000 -ac 1 -c:a pcm_s16le samples/alice.wav
 ```
-
-Ctrl+C — корректная остановка с дожиданием финальных результатов, повторный Ctrl+C — сразу.
